@@ -1,0 +1,32 @@
+{
+  "name": "nasdaq-swing-bot",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin wrapping the Java Nasdaq swing-detection bot (polls COMP every minute, reasons with a local Ollama model, emails on new swing highs/lows).",
+  "author": "OpenClaw PoC",
+  "license": "MIT",
+  "type": "plugin",
+  "entry": "handlers.py",
+  "capabilities": [
+    "start",
+    "stop",
+    "status",
+    "alert-tail"
+  ],
+  "config": {
+    "jar": "path to nasdaq-swing-bot-0.1.0.jar",
+    "java": "java",
+    "symbol": "COMP",
+    "provider": "NASDAQ",
+    "finnhubApiKey": "",
+    "intervalSeconds": 60,
+    "ollamaBaseUrl": "http://127.0.0.1:11435",
+    "ollamaModel": "gemma3:4b",
+    "smtpHost": "",
+    "smtpPort": 587,
+    "smtpUser": "",
+    "smtpPassword": "",
+    "mailFrom": "",
+    "mailTo": ""
+  },
+  "notes": "Java SDK surface is not available upstream; this plugin shells out to the packaged jar. Config values map 1:1 to Main CLI flags."
+}
