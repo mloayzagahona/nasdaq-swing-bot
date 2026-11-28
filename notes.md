@@ -39,6 +39,12 @@ Can you show me how to add a fallback in the FinBertTranslator to auto-detect to
 What is the maximum input length this FinBERT model can handle, and how should I handle longer headlines?
 
 
+Can you show me how to log the OllamaException in the SentimentCli batch run so I can see which headlines fell back to FinBERT?
+
+What are the pros and cons of using FinGPT as the deep analyzer instead of Qwen for financial sentiment?
+
+Could you suggest how to tune the confidence threshold in FinBERT to avoid miscalls on contrastive phrases like 'X, but Y'?
+
 Spring
 Can you show me how to add WebSocket push notifications so clients get the result without polling?
 

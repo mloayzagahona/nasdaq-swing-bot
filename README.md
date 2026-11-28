@@ -1,374 +1,218 @@
 # OpenClaw Nasdaq Swing Bot
 
-A proof-of-concept Java bot that watches the **Nasdaq Index** (default `COMP`,
-the Composite) every minute, detects **new swing highs/lows** with a fractal
-rule, asks a **local Ollama LLM** to write a short narrative for each alert, and
-sends an **email**. State is persisted across restarts so already-confirmed
-swings are never re-alerted.
+A **Java 25** proof-of-concept bot that polls a Nasdaq index, detects *confirmed swing highs/lows* with a fractal rule, narrates each event with a **local Ollama model**, emails an alert, and persists state across restarts. Fully self-contained (Maven shade fat jar); no cloud AI dependencies.
 
-| | |
-|---|---|
-| Version | 0.1.0 (PoC) |
-| Language / runtime | Java 21 (built with JDK 25, Maven `release=21`) |
-| Build | Maven 3.9+, shade/fat jar |
-| Agent platform | OpenClaw (thin plugin shells out to the jar) |
-| Needs | JDK 21+ to run, Maven 3.9+ to build, a local Ollama server |
+**Build:** JDK 25 / Maven `release=25`
+**Main class:** `com.openclaw.bot.Main`
+**Jar:** `target/nasdaq-swing-bot-0.1.0.jar` (self-contained)
 
 ---
 
-## What it does
+## 1. Architecture Map
 
-1. **Polls** a market index every 60 s (live mode; fast cadence in replay/demo).
-2. **Detects** confirmed swing highs/lows with a fractal rule
-   (`SwingDetector`, confirm bars = 2, minimum delta = 0.05%).
-3. **Narrates** each event with a local Ollama model (`OllamaClient` →
-   `POST /api/generate`).
-4. **Emails** the alert via SMTP — or, when no SMTP credentials are set,
-   writes an RFC-822 `.eml` file under `capture/` (never silently drops).
-5. **Persists** state to `state/bot-state.json` so restarts resume without
-   duplicate alerts.
-
----
-
-## Architecture
-
-```mermaid
-flowchart TB
-    subgraph OpenClaw["OpenClaw agent platform"]
-        PLUGIN["plugin/handlers.py<br/>start / stop / status / alert_tail"]
-        SKILL["skill/SKILL.md<br/>operator runbook"]
-    end
-
-    PLUGIN -- "shell-out: java -jar" --> MAIN
-
-    subgraph JVM["Java application (JVM)"]
-        MAIN["Main"] --> CFG["BotConfig<br/>flag > env > default"]
-        MAIN --> SCHED["ScheduledExecutorService<br/>tick every 60s (live)"]
-
-        SCHED --> PROVIDER["MarketDataProvider"]
-        PROVIDER --> ND["NasdaqApiClient<br/>api.nasdaq.com (live)"]
-        PROVIDER --> FH["FinnhubClient<br/>finnhub.io (realtime, key)"]
-        PROVIDER --> YH["YahooFinanceClient<br/>(rate-limited from this box)"]
-        PROVIDER --> CSV["CsvReplayProvider<br/>offline demo/tests"]
-
-        SCHED --> DET["SwingDetector<br/>fractal rule (confirm=2, Δ≥0.05%)"]
-        DET --> EVT["SwingEvent<br/>HIGH/LOW, price, previousExtreme"]
-
-        EVT --> NARR["AiNarrator -> OllamaClient<br/>local /api/generate"]
-        EVT --> MAIL["EmailSender"]
-        MAIL --> SMTP["SmtpEmailSender<br/>Jakarta Mail (SMTP)"]
-        MAIL --> FILE["FileEmailSender<br/>.eml capture"]
-        MAIL --> SINK["DebugSmtpSink<br/>loopback sink (--demo)"]
-
-        EVT --> STATE["StateStore<br/>state/bot-state.json"]
-    end
+```
+src/main/java/com/openclaw/bot/
+  Main.java                   # entry point: arg parsing → wiring → bot.run()
+  config/BotConfig.java       # flag > env > default; immutable builder
+  market/                     # MarketDataProvider abstraction + 4 providers
+    MarketDataProvider.java   #   interface { quote(); hasNext(); }
+    Quote.java                #   record: symbol, last, prevClose, dayHigh/Low, ts, status
+    Sample.java               #   record: millis, price
+    NasdaqApiClient.java      #   live default (api.nasdaq.com, index assetclass)
+    YahooFinanceClient.java   #   alternative (rate-limited on DC IPs)
+    FinnhubClient.java        #   alternative (requires API key, COMP→^IXIC mapping)
+    CsvReplayProvider.java    #   deterministic offline replay (millis,price CSV)
+  swing/
+    SwingDetector.java        # fractal rule: confirm bars left/right + minDeltaPct
+    SwingEvent.java           # record (Type HIGH/LOW, price, atMillis, prev, deltaPct) + fingerprint
+  ai/
+    AiNarrator.java           # interface { narrate(prompt) }
+    OllamaClient.java         # local Ollama /api/generate (think=false, num_predict=500)
+  email/
+    EmailSender.java          # interface { send(subject, body) }
+    SmtpEmailSender.java      # real Jakarta Mail (STARTTLS/SSL by port)
+    FileEmailSender.java      # offline RFC-822 .eml fallback (never drops alerts)
+    DebugSmtpSink.java        # loopback SMTP sink for --demo
+  state/StateStore.java       # JSON persistence (extremes, alert fingerprint, ticks)
+  bot/NasdaqBot.java          # tick loop: fetch → detect → narrate → email → persist
+  sentiment/                  # standalone sentiment subsystem (see §6)
 ```
 
-### Tick loop (single scheduled thread)
+### Core data flow (one tick)
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant S as Scheduler
-    participant P as MarketDataProvider
-    participant D as SwingDetector
-    participant O as OllamaClient
-    participant E as EmailSender
-    participant T as StateStore
-
-    loop every 60 s
-        S->>P: quote()
-        P-->>S: Sample(symbol, price, ts, high, low, prevClose)
-        S->>D: accept(sample)
-        alt swing HIGH/LOW confirmed & beats previous extreme
-            D-->>S: SwingEvent
-            S->>O: generate(prompt)
-            O-->>S: narrative
-            S->>E: send(alert)
-            S->>T: persist(extremes, fingerprint)
-        else no new extreme
-            S->>T: persist(tick only)
-        end
-    end
+```
+MarketDataProvider.quote()
+      │  Quote
+      ▼
+SwingDetector.accept(Sample)      → Optional<SwingEvent>
+      │  when confirmed new extreme beats previous by ≥ minDeltaPct
+      ▼
+NasdaqBot.handleEvent(SwingEvent, Quote)
+      │  buildPrompt() (concise, ~150 tokens, "no markdown")
+      ▼
+AiNarrator.narrate(prompt)        → narrative text (Ollama, local)
+      ▼
+EmailSender.send(subject, body)   → SMTP | loopback sink | .eml file
+      │
+      ▼
+StateStore.recordExtremes / recordAlert(fingerprint) → persist to JSON
 ```
 
 ---
 
-## Swing detection rule (fractal)
+## 2. Swing Detection (the core rule)
 
-- A bar at index *i* is a swing **HIGH** if its price is strictly greater than
-  the `--confirm` bars before and after it (default **2**).
-- A swing **LOW** is the mirror image.
-- A confirmed extremum becomes an **alert only if it beats the previous
-  confirmed extreme of the same type by at least `--min-delta-pct`** (default
-  **0.05%**). Otherwise it just updates the internal baseline.
-- Highs and lows are tracked separately; every event records `previousExtreme`
-  and `deltaPct` for the email.
+`SwingDetector` implements a **fractal rule**:
 
-The synthetic series in `data/replay.csv` produces exactly 4 events, which the
-unit and end-to-end tests assert:
+- A bar is a swing **HIGH** if it is greater than the `confirm` bars before *and* `confirm` bars after it; symmetric for LOW.
+- Default `confirm = 2` → a pivot needs `2*confirm+1 = 5` samples.
+- A **trigger/alert** fires only when a confirmed extremum *strictly beats* the previously confirmed extreme of the same type by at least `minDeltaPct` (default 0.05%).
+- Non-decisive confirmed extremes are remembered (not alerted) to suppress noise.
+- State is **stateless across restarts** via `StateStore`: extremes are restored on boot so the bot never re-alerts on levels it already signaled.
 
-| # | Type | Price | Note |
-|---|------|-------|------|
-| 1 | HIGH | 105.00 | first confirmed pivot |
-| 2 | LOW | 98.60 | lower than prior low |
-| 3 | HIGH | 112.10 | beats 105.00 |
-| 4 | HIGH | 113.10 | beats 112.10 |
+**Tests:** `src/test/java/com/openclaw/bot/swing/SwingDetectorTest.java` — confirmed high/low detection, `minDelta` filtering of small new extremes, no duplicate event on peak-revisit below prior extreme.
 
 ---
 
-## Market data sources
+## 3. Market Data Providers (`MarketDataProvider`)
 
-| Provider | Endpoint | Notes |
-|---|---|---|
-| `NASDAQ` (default) | `https://api.nasdaq.com/api/quote/{SYM}/info?assetclass=index` | Works from this host; needs a browser `User-Agent` header. Delayed (`isRealTime: false`). |
-| `FINNHUB` | `https://finnhub.io/api/v1/quote?symbol=^IXIC&token=KEY` | Realtime; needs a free API key. `COMP` → `^IXIC`, `NDX` → `^NDX`. Free tier = 30 calls/min (plenty for 1/min). |
-| `YAHOO` | `query1.finance.yahoo.com/...` | Rate-limited (`Too Many Requests`) from this box. |
-| `CSV` | local file | Offline replay (`data/replay.csv`) for demos and tests. |
+| Provider | Default? | Source | Notes |
+|----------|:-------:|-------|-------|
+| `NasdaqApiClient` | ✅ | `api.nasdaq.com` (`GET /api/quote/{symbol}/info?assetclass=index`) | Robust number parsing (`"26,214.17"`, `"--"`→NaN). Index symbols (`COMP`, `^IXIC`). |
+| `YahooFinanceClient` | — | Yahoo chart v8 API | Kept for whitelisted environments; Yahoo frequently rate-limits datacenter IPs → prefer Nasdaq. |
+| `FinnhubClient` | — | `finnhub.io/api/v1/quote` | Requires API key (`FINNHUB_API_KEY`); maps `COMP`→`^IXIC`, `NDX`→`^NDX`. |
+| `CsvReplayProvider` | — | CSV file | Deterministic offline demos/tests. Lines: `epochMillis,price` or `yyyy-MM-dd'T'HH:mm:ss,price`; `#` comments ignored. `hasNext()` false when exhausted. |
 
-> **Finnhub** was integrated as the realtime replacement for the delayed Nasdaq
-> snapshot. The API key is **never stored in code**: it is read from the
-> `FINNHUB_API_KEY` environment variable or passed with `--finnhub-key`, and
-> lives in `BotConfig` memory only. Selecting `--provider FINNHUB` without a key
-> is a hard startup error, not a silent fallback.
-
-See `docs/TECHNICAL.md` §4 for the full source-comparison table.
+Choose via `--provider NASDAQ|YAHOO|FINNHUB|CSV` (default NASDAQ) or `--demo`/`--replay`.
 
 ---
 
-## Requirements
+## 4. AI Narration (OllamaClient)
 
-- **JDK 21+** (built and tested with JDK 25)
-- **Maven 3.9+**
-- A **local Ollama server** with at least one model pulled.
+- Calls the **local** Ollama server (`/api/generate`) — no cloud LLM.
+- Sends `"think": false` — critical for gemma4/qwen3.5 family models that otherwise spend their whole `num_predict` budget on hidden chain-of-thought and return an empty `response`.
+- `num_predict = 500`; temperature from config; empty response → `IOException`.
+- Model default: `gemma4-e4b-64k:latest` (fallback `gemma3:4b`); server on `127.0.0.1:11435` (dedicated) or default `11434`.
 
-### Ollama: CPU-only server (this machine)
+---
 
-The GPU on this box is nearly full (≈9.1/10.2 GiB), so the default daemon
-(port **11434**) hits CUDA OOM. The working setup is a dedicated **CPU-only
-server on port 11435**, pointed at the system model store:
+## 5. Email Delivery & Fail-Safes
+
+| Mode | When | Delivery |
+|------|------|----------|
+| `SmtpEmailSender` | `--smtp-host` set | Real Jakarta Mail; SSL on port 465, else STARTTLS; auth when user set |
+| `DebugSmtpSink` | `--demo` | Loopback SMTP sink on 2525 + real SMTP client exercising the actual delivery path; logs to `capture/debug-smtp.log` |
+| `FileEmailSender` | no SMTP, not demo | Writes RFC-822 `.eml` files to `capture/` — **the bot never drops an alert silently** |
+
+---
+
+## 6. Sentiment Subpackage (`com.openclaw.bot.sentiment`)
+
+A **standalone subsystem** — not called by the bot's tick loop (`NasdaqBot` only mentions "sentiment" inside the narrative prompt).
+
+| Class | Role |
+|-------|------|
+| `SentimentCli` | CLI: single `--text` / `--file` / `--batch`; `--json` for jq; `--deep`/`--force-deep`/`--cross-check` escalation |
+| `FinBertSentiment` | Local DJL FinBERT classifier (fast pass) |
+| `OllamaSentimentAnalyzer` | Deep LLM analysis (structured JSON: sentiment, score, entities, key_drivers, caveats); empty-content retry |
+| `FinGptSentiment` | Optional cross-check classifier (disagreement → auto-escalate) |
+| `SentimentAggregator` | Time-decayed rolling score (60-min half-life, 24h window); `DeepBudget` gate |
+| `SeenStore` | Persistent article dedupe |
+| `NewsPoller` | Standalone polling loop (Finnhub news → ingest → per-symbol score); requires `FINNHUB_API_KEY` |
+| `SeenStoreTest` | Offline self-test |
+
+> ⚠️ **Port/model pitfall:** the sentiment package defaults to Ollama on **11434** with `gemma4-e4b-64k:latest`; the bot's dedicated server runs on **11435**. `FinBertSentiment` reloads its model per headline in batch mode (known inefficiency).
+
+See `src/main/java/com/openclaw/bot/sentiment/README.md` for the full sentiment runbook and test matrix.
+
+---
+
+## 7. Configuration (precedence: `--flag` > env > default)
+
+| Flag | Env | Default | Meaning |
+|------|-----|---------|---------|
+| `--symbol SYM` | — | `COMP` | Index symbol |
+| `--interval SEC` | — | `60` | Poll interval (seconds) |
+| `--once` | — | off | Single tick then exit (cron/smoke) |
+| `--demo` | — | off | Replay + loopback SMTP sink (no real email) |
+| `--replay FILE` | — | — | CSV for demo/CSV provider |
+| `--provider NAME` | — | `NASDAQ` | `NASDAQ|YAHOO|FINNHUB|CSV` |
+| `--finnhub-key KEY` | `FINNHUB_API_KEY` | — | Required for FINNHUB |
+| `--model MODEL` | — | `gemma4-e4b-64k:latest` | Ollama model tag |
+| `--ollama-url URL` | — | `http://localhost:11434` | Ollama base URL |
+| `--confirm N` | — | `2` | Swing confirmation bars |
+| `--min-delta-pct PCT` | — | `0.05` | Min % vs previous extreme to alert |
+| `--smtp-host/port/user` | `SMTP_HOST/PORT/USERNAME` | — | SMTP settings |
+| `--from / --to` | `MAIL_FROM / MAIL_TO` | — | Alert sender/recipients |
+| `--state FILE` | — | `state/bot-state.json` | State file |
+| `--capture-dir DIR` | — | `capture` | Offline alert capture dir |
+
+---
+
+## 8. Build, Test & Run
 
 ```bash
-OLLAMA_NUM_GPU=0 \
-OLLAMA_MODELS=/usr/share/ollama/.ollama/models \
-OLLAMA_HOST=127.0.0.1:11435 \
-ollama serve
-```
+# Build (fat jar)
+mvn -q -DskipTests package          # → target/nasdaq-swing-bot-0.1.0.jar
+# or use full mvn path if not on PATH:
+# ~/.hermes/tools/apache-maven-3.9.6/bin/mvn
 
-> **Pitfall:** the system daemon runs as user `ollama` and stores models in
-> `/usr/share/ollama/.ollama/models`, *not* `~/.ollama/models`. Pointing
-> `OLLAMA_MODELS` at the empty home dir makes the server report `total blobs: 0`
-> and no models.
-
-Verified CPU inference with `gemma3:4b` (also available: `qwen3.5:4b`,
-`llama3.2:3b`, `phi4-mini`, `hermes3:8b`, `mimo-v2.6:9b`, …).
-
----
-
-## Build
-
-```bash
-mvn -q -DskipTests package
-# → target/nasdaq-swing-bot-0.1.0.jar (shaded, runnable)
-```
-
-Tests (unit + end-to-end):
-
-```bash
+# Tests (JUnit 5; offline-safe — no network / Ollama)
 mvn test
-```
 
----
-
-## Run
-
-### Offline demo (no API keys, no real email)
-
-Replays `data/replay.csv` at a fast cadence, narrates with local Ollama, and
-delivers over a **real SMTP client → loopback sink** (port 2525), capturing the
-messages to `capture/debug-smtp.log`:
-
-```bash
+# Offline demo (no keys, no real email)
 java -jar target/nasdaq-swing-bot-0.1.0.jar --demo \
-  --replay data/replay.csv \
-  --ollama-url http://127.0.0.1:11435 \
-  --model gemma3:4b
+  --replay data/replay.csv --ollama-url http://127.0.0.1:11435
+
+# Live
+java -jar target/nasdaq-swing-bot-0.1.0.jar \
+  --ollama-url http://127.0.0.1:11435 --symbol COMP
+
+# One tick (smoke / cron)
+java -jar target/nasdaq-swing-bot-0.1.0.jar --once
+
+# Real SMTP
+SMTP_HOST=smtp.gmail.com SMTP_PORT=587 SMTP_USERNAME=x SMTP_PASSWORD=... \
+  MAIL_TO=me@corp.com java -jar target/nasdaq-swing-bot-0.1.0.jar
 ```
 
-This exercises the whole pipeline end-to-end (fetch → detect → narrate → SMTP)
-without credentials.
+### Test suite
 
-### Live (Nasdaq public API, every 60 s)
-
-```bash
-java -jar target/nasdaq-swing-bot-0.1.0.jar --symbol COMP \
-  --ollama-url http://127.0.0.1:11435 \
-  --model gemma3:4b
-```
-
-### Live via Finnhub (realtime)
-
-```bash
-export FINNHUB_API_KEY=dc3knv9r01qk29kceq20dc3knv9r01qk29kceq2g
-java -jar target/nasdaq-swing-bot-0.1.0.jar --symbol COMP \
-  --provider FINNHUB \
-  --ollama-url http://127.0.0.1:11435 \
-  --model gemma3:4b
-```
+| File | Covers |
+|------|--------|
+| `SwingDetectorTest` | Fractal detection, minDelta filtering, duplicate suppression |
+| `FinnhubClientTest` | Parsing, alias mapping (COMP→^IXIC), missing optional fields, API-key requirement |
+| `DemoPipelineTest` | End-to-end demo with stub narrator + replay data |
+| `SeenStoreTest` (sentiment) | Seen-store persistence, round-trip, corrupt/missing file tolerance |
 
 ---
 
-## Configuration reference
+## 9. State & Persistence
 
-Precedence: **JVM argument → environment variable → default**.
+`StateStore` persists (JSON, corrupt/missing → fresh state):
 
-| CLI flag | Env var | Default | Meaning |
-|---|---|---|---|
-| `--symbol` | `SYMBOL` | `COMP` | Index: `COMP` or `NDX` |
-| `--provider` | `PROVIDER` | `NASDAQ` | `NASDAQ` \| `YAHOO` \| `FINNHUB` \| `CSV` |
-| `--finnhub-key` | `FINNHUB_API_KEY` | (empty) | Finnhub key; required for `FINNHUB` |
-| `--interval` | `INTERVAL_SECONDS` | `60` | Live polling period (s) |
-| `--once` | — | off | Single tick, then exit |
-| `--demo` | — | off | Replay + fast cadence + loopback SMTP sink |
-| `--replay` | `REPLAY_FILE` | `data/replay.csv` | CSV path (`millis,price` or ISO-8601) |
-| `--model` | `OLLAMA_MODEL` | `gemma4-e4b-64k:latest` | Ollama model tag. Default `gemma4-e4b-64k:latest`; fallback `gemma3:4b`; thinking models handled (`think=false` sent). See `docs/model-benchmarks.md` |
-| `--ollama-url` | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama base URL (use `…:11435` here) |
-| `--confirm` | `SWING_CONFIRM` | `2` | Bars before/after to confirm a swing |
-| `--min-delta-pct` | `SWING_MIN_DELTA_PCT` | `0.05` | Min % vs previous extreme to alert |
-| `--smtp-host` | `SMTP_HOST` | (empty) | SMTP server (empty → file capture) |
-| `--smtp-port` | `SMTP_PORT` | `587` | SMTP port (465 = implicit SSL, else STARTTLS) |
-| `--smtp-user` | `SMTP_USERNAME` | (empty) | SMTP username |
-| `--smtp-password` (env only) | `SMTP_PASSWORD` | (empty) | SMTP password |
-| `--from` | `MAIL_FROM` | `nasdaq-swing-bot@local` | Sender address |
-| `--to` | `MAIL_TO` | (empty) | Recipients (comma-separated) |
-| `--state` | — | `state/bot-state.json` | State file path |
-| `--capture-dir` | `BOT_CAPTURE_DIR` | `capture` | Offline `.eml` capture dir |
+- `lastSwingHigh` / `lastSwingLow` (+ timestamps) — restore extremes across restarts
+- `lastAlertFingerprint` — duplicate-alert suppression (`SwingEvent.fingerprint()` = `TYPE@price#atMillis`, 4-dp rounded)
+- `lastTickMillis`, `samplesSeen` — counters
 
-|**Email default behavior:** no SMTP host configured → alerts are written as
-|`.eml` files under `capture/` (millisecond-timestamped, collision-safe). No
-|credentials are stored or invented anywhere in the codebase.
-
-**Switching the narrative model:** run with `--model <tag>` (or set
-`OLLAMA_MODEL`). The default `gemma4-e4b-64k:latest` works out of the box
-(thinking is disabled internally). If you need to switch, `gemma3:4b` is the
-tested fallback — same prompt, slightly slower, no thinking behavior; for
-richer prose try `hermes3:8b`. Full measurements and notes:
-`docs/model-benchmarks.md`.
+> ℹ️ **Do not commit** `state/bot-state.json` or `capture/` artifacts. No credentials in code/README — SMTP password and API keys are env-only.
 
 ---
 
-## State & restart semantics
+## 10. Conventions & Pitfalls
 
-`StateStore` writes `state/bot-state.json` after every relevant tick:
-
-- `lastSwingHigh` / `lastSwingLow` + timestamps — last confirmed extremes;
-- `lastAlertFingerprint` — `TYPE@price#epochMillis` of the last alert, used to
-  suppress duplicate emails for the same confirmed swing;
-- `lastTickMillis`, `samplesSeen` — observability.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Polling
-    Polling --> Detecting: quote returned
-    Detecting --> Narrating: swing confirmed & beats previous
-    Detecting --> Polling: no new extreme
-    Narrating --> Sending: narrative ready
-    Sending --> Persisting: email sent / captured
-    Persisting --> Polling
-```
-
-> **Known caveat:** the detector's confirmation window is in-memory. After a
-> restart only the extremes are restored, so a brand-new swing is computed from a
-> cold window (the next `confirm` bars re-baseline). The *same* fingerprint can
-> never re-alert; a genuinely new swing shortly after restart will. If replay-
-> across-restart behavior is required, seed the detector from the Nasdaq
-> historical endpoint on startup (a natural next step).
+- **`think=false` is mandatory** in both `OllamaClient` and `OllamaSentimentAnalyzer` — thinking models return empty responses otherwise. Keep `num_predict ≥ 500` for narratives.
+- **No markdown in narratives** — prompt instructs plain text; some models (`mimo-v2.6`) emit `**bold**` anyway.
+- Keep `buildPrompt` concise (~150 tokens).
+- Tests must not require network or a live Ollama server.
+- Avoid `sun.misc.Unsafe`-style deprecation warnings (warnings only; build stays green).
 
 ---
 
-## OpenClaw integration
+## 11. Related Docs
 
-OpenClaw has no native Java SDK surface, so the integration shells out to the
-packaged jar:
-
-- `openclaw/plugin/plugin.json` — manifest; capabilities `start` / `stop` /
-  `status` / `alert_tail`; config keys mirror the CLI (symbol, provider,
-  finnhubApiKey, intervalSeconds, ollamaBaseUrl, ollamaModel, SMTP fields).
-- `openclaw/plugin/handlers.py` — `start` launches the jar as a subprocess
-  (PID recorded in `state.json`), `stop` SIGTERMs it (graceful shutdown persists
-  state), `status` reads `state/bot-state.json`, `alert_tail` tails
-  `capture/debug-smtp.log`.
-- `openclaw/skill/SKILL.md` — operator runbook with quick-start commands,
-  handler descriptions, and config mapping.
-
----
-
-## Project layout
-
-```
-.
-├── pom.xml                          # Maven build (Java 21, shade fat jar)
-├── data/
-│   └── replay.csv                   # synthetic OHLC stream for demos/tests
-├── docs/
-│   └── TECHNICAL.md                 # full technical document
-├── openclaw/
-│   ├── plugin/
-│   │   ├── plugin.json              # OpenClaw plugin manifest
-│   │   └── handlers.py              # start/stop/status/alert_tail
-│   └── skill/
-│       └── SKILL.md                 # operator runbook
-├── src/
-│   ├── main/java/com/openclaw/bot/
-│   │   ├── Main.java                # entry point, CLI parsing
-│   │   ├── config/BotConfig.java    # flag > env > default
-│   │   ├── bot/NasdaqBot.java       # scheduler, tick loop
-│   │   ├── market/                  # MarketDataProvider implementations
-│   │   │   ├── MarketDataProvider.java
-│   │   │   ├── Quote.java, Sample.java
-│   │   │   ├── NasdaqApiClient.java
-│   │   │   ├── FinnhubClient.java
-│   │   │   ├── YahooFinanceClient.java
-│   │   │   └── CsvReplayProvider.java
-│   │   ├── swing/                   # SwingDetector, SwingEvent
-│   │   ├── ai/                      # AiNarrator, OllamaClient
-│   │   ├── email/                   # EmailSender, SmtpEmailSender,
-│   │   │                           #   FileEmailSender, DebugSmtpSink
-│   │   └── state/StateStore.java    # JSON persistence
-│   └── test/java/...                # unit + end-to-end tests
-├── capture/                         # .eml / demo SMTP captures (git-ignored)
-└── state/bot-state.json             # persisted bot state (git-ignored)
-```
-
----
-
-## Security & data notes
-
-- **No credentials in code.** Finnhub key comes from env/CLI; SMTP credentials
-  are opt-in via config; nothing is hard-coded or invented.
-- **Local by design.** Model inference runs on this machine; the only external
-  egress is the configured market-data poll (and SMTP if you enable it).
-- Demo artifacts (`capture/`, `state/`) are git-ignored.
-
----
-
-## Limitations & next steps
-
-**Limitations**
-
-- Nasdaq snapshot is delayed (`isRealTime: false`); Finnhub fills the realtime
-  gap but still needs the operator's API key.
-- Swing rule is a simple fractal — no trend/volume context (deliberate for PoC).
-- Detector confirmation window is in-memory (see state caveat).
-- OpenClaw integration is shell-out based, not a native SDK.
-- CPU inference is slower than GPU; a ~4B model is comfortable at 1-minute cadence.
-
-**Next steps**
-
-1. Seed the detector from historical daily bars on startup.
-2. Wire real SMTP credentials and test external delivery.
-3. Add a licensed intraday feed for true 1-minute bars.
-4. Package as a systemd unit / container with health checks.
-5. Add alert throttling (per-day cap) and a small dashboard.
-
-More detail in `docs/TECHNICAL.md`.
+- `src/main/java/com/openclaw/bot/sentiment/README.md` — sentiment package runbook + scenario test matrix
+- `docs/TECHNICAL.md` — detailed design
+- `docs/model-benchmarks.md` — Ollama model measurements & selection
+- `openclaw/plugin/handlers.py` — OpenClaw plugin (start/stop/status/alert_tail)
+- `openclaw/skill/SKILL.md` — operator runbook

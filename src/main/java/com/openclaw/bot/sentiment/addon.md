@@ -165,3 +165,238 @@ How can I use thread-local FinBERT models to avoid model loading contention in t
 
 How can I make the `--concurrency` option dynamically cap itself based on GPU memory when Ollama is enabled?
 
+
+Here's how to implement it. The key architectural change: a **shared `DeepBudget` counter** passed through `analyzeOne`, so the cap is enforced across the whole batch (not per-headline). All deep calls — whether triggered by `--deep`, low confidence, `--force-deep`, or cross-check disagreement — draw from the same budget.
+
+## 1. Add the budget class (nested in `SentimentCli`)
+
+```java
+/**
+ * Tracks how many deep Ollama calls a batch may make. Shared across all
+ * headlines so the cap applies to the whole run.
+ */
+private static final class DeepBudget {
+    private final int max;
+    private int used;
+
+    DeepBudget(int max) {
+        this.max = max;
+    }
+
+    /** Returns true if a deep call is allowed, consuming one slot. */
+    synchronized boolean tryAcquire() {
+        if (used >= max) {
+            return false;
+        }
+        used++;
+        return true;
+    }
+
+    int used() { return used; }
+    int max() { return max; }
+}
+```
+
+(`synchronized` is defensive — the batch loop is single-threaded today, but it keeps this safe if you parallelize later.)
+
+## 2. Parse and validate the flag
+
+```java
+/** Returns null when --max-deep-per-batch is absent (unlimited). */
+private static DeepBudget resolveDeepBudget(Map<String, String> opts) {
+    String raw = opts.get("--max-deep-per-batch");
+    if (raw == null) {
+        return null;
+    }
+    try {
+        int v = Integer.parseInt(raw.trim());
+        if (v < 1) {
+            throw new NumberFormatException("must be >= 1");
+        }
+        return new DeepBudget(v);
+    } catch (NumberFormatException e) {
+        LOG.error("Invalid --max-deep-per-batch value: \"{}\" — {}", raw, e.getMessage());
+        printUsage();
+        System.exit(2);
+        return null; // unreachable
+    }
+}
+```
+
+## 3. Add the `deepSkipReason` field to `RunResult`
+
+```java
+private record RunResult(
+        FinBertSentiment.SentimentResult finbert,
+        DeepAnalysis ollama,
+        String error,
+        String source,
+        String ollamaError,
+        FinGptSentiment.FinGptResult crossCheck,
+        String deepSkipReason) { }
+```
+
+## 4. Update `analyzeOne()` — budget check before deep call
+
+```java
+private static RunResult analyzeOne(String text,
+                                    Map<String, String> opts,
+                                    double minConfidence,
+                                    boolean forceDeep,
+                                    int numCtx,
+                                    boolean useCrossCheck,
+                                    DeepBudget deepBudget) {
+
+    Path modelPath = Path.of(opts.getOrDefault("--model-path",
+            "/home/mloayzag/models/finbert"));
+    String ollamaModel = opts.getOrDefault("--model", "gemma4-e4b-64k:latest");
+    String ollamaBase = opts.getOrDefault("--base-url", "http://localhost:11434");
+    boolean deepEnabled = opts.containsKey("--deep") || opts.containsKey("--force-deep");
+    boolean verbose = opts.containsKey("--verbose");
+    String fingptModel = opts.getOrDefault("--fingpt-model", "fingpt-sentiment");
+
+    FinBertSentiment finbert = new FinBertSentiment(modelPath);
+    try {
+        FinBertSentiment.SentimentResult fast = finbert.analyze(text);
+
+        // Optional cross-check with FinGPT (best-effort; never fatal).
+        FinGptSentiment.FinGptResult crossCheck = null;
+        if (useCrossCheck) {
+            try {
+                crossCheck = new FinGptSentiment(ollamaBase, fingptModel).analyze(text);
+            } catch (Exception e) {
+                if (verbose) {
+                    LOG.debug("FinGPT cross-check skipped: {}", e.getMessage());
+                }
+            }
+        }
+
+        // Disagreement between FinBERT and FinGPT is an explicit escalation
+        // trigger — it forces deep analysis even without --deep.
+        boolean disagree = false;
+        if (crossCheck != null) {
+            String finbertLabel = mapFinBertLabel(fast.sentiment());
+            disagree = !finbertLabel.equals(crossCheck.sentiment());
+        }
+
+        boolean shouldEscalate = (deepEnabled
+                && (forceDeep || fast.confidence() < (float) minConfidence))
+                || (useCrossCheck && disagree);
+
+        if (!shouldEscalate) {
+            return new RunResult(fast, null, null, "finbert", null, crossCheck, null);
+        }
+
+        // Budget gate: if the batch cap is exhausted, skip deep analysis
+        // and record why (the headline still gets FinBERT + cross-check).
+        if (deepBudget != null && !deepBudget.tryAcquire()) {
+            String reason = "max deep calls reached (" + deepBudget.max() + ")";
+            if (verbose) {
+                LOG.warn("Deep analysis SKIPPED for headline=\"{}\" | {}", text, reason);
+            }
+            return new RunResult(fast, null, null, "finbert", null, crossCheck, reason);
+        }
+
+        try {
+            DeepAnalysis deep = new OllamaSentimentAnalyzer(
+                    ollamaBase, ollamaModel, null, numCtx).analyze(text);
+            return new RunResult(fast, deep, null, "both", null, crossCheck, null);
+        } catch (Exception e) {
+            String reason = (e.getMessage() == null) ? e.toString() : e.getMessage();
+            if (verbose) {
+                LOG.warn("Ollama deep analysis FAILED — fell back to FinBERT | headline=\"{}\" | {}",
+                        text, reason);
+            } else {
+                LOG.debug("Ollama deep analysis FAILED — fell back to FinBERT | headline=\"{}\" | {}",
+                        text, reason);
+            }
+            return new RunResult(fast, null, null, "finbert", reason, crossCheck, null);
+        }
+    } catch (Exception e) {
+        LOG.error("FinBERT analysis failed for headline=\"{}\"", text, e);
+        return new RunResult(null, null, e.getMessage(), null, null, null, null);
+    } finally {
+        finbert.close();
+    }
+}
+```
+
+## 5. Wire it into `main()` and `runBatch()`
+
+In `main()`:
+
+```java
+int numCtx = resolveNumCtx(opts);
+DeepBudget deepBudget = resolveDeepBudget(opts);
+boolean crossCheck = opts.containsKey("--cross-check") || opts.containsKey("--voting");
+
+RunResult run = analyzeOne(text, opts, minConfidence, forceDeep, numCtx, crossCheck, deepBudget);
+```
+
+In `runBatch()`:
+
+```java
+int numCtx = resolveNumCtx(opts);
+DeepBudget deepBudget = resolveDeepBudget(opts);
+boolean crossCheck = opts.containsKey("--cross-check") || opts.containsKey("--voting");
+
+for (String headline : headlines) {
+    RunResult run = analyzeOne(headline, opts, minConfidence, forceDeep,
+            numCtx, crossCheck, deepBudget);
+    ...
+}
+
+// Summary line after the loop — always logged, regardless of --verbose:
+if (deepBudget != null) {
+    LOG.info("Deep budget: {} / {} used", deepBudget.used(), deepBudget.max());
+}
+```
+
+## 6. Surface the skip in JSON and human output
+
+In `buildJson()`:
+
+```java
+if (run.deepSkipReason() != null) {
+    out.put("deep_skipped", run.deepSkipReason());
+}
+```
+
+In `printHuman()` (after the FinBERT line):
+
+```java
+if (run.deepSkipReason() != null) {
+    System.out.printf("(deep analysis skipped: %s)%n", run.deepSkipReason());
+}
+```
+
+## 7. Usage text
+
+```java
+LOG.error("  [--max-deep-per-batch]  Cap deep Ollama calls per batch (default: unlimited)");
+```
+
+No `parseArgs` change needed — `--max-deep-per-batch` is not in the value-less flag list, so it naturally consumes the next token as its value.
+
+## Behavior
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=com.openclaw.bot.sentiment.SentimentCli \
+  -Dexec.args="--batch headlines.txt --cross-check --max-deep-per-batch 3 --json"
+```
+
+- First 3 headlines needing escalation → deep analysis runs normally (`"source": "both"`).
+- Headlines 4+ still needing escalation → deep call skipped; `"source": "finbert"` and `"deep_skipped": "max deep calls reached (3)"` in the JSON; FinBERT + cross-check results still present.
+- The batch summary line prints `Deep budget: 3 / 3 used` to stderr via slf4j.
+- In single mode (no `--batch`), the same flag works naturally: `--max-deep-per-batch 1` means at most one deep call, which for a single headline is effectively an on/off switch.
+
+One design note: the budget is consumed **only when escalation is actually attempted** (after `shouldEscalate`), so headlines that don't need deep analysis never waste slots. And the count includes deep calls triggered by cross-check disagreement — that's the point of the cap, since `--cross-check` alone can otherwise generate one deep call per conflicted headline.
+
+Want me to also emit the budget usage (used/max) as a top-level field on the batch output, so downstream consumers don't have to scrape stderr for it?
+
+
+Can you show me how to add the deep budget usage as a top-level field in the batch JSON output?
+
+How would I parallelize the batch processing to speed up the analysis, and what changes would the DeepBudget need to support that?
+
+Could you add a --min-agreement-threshold flag to only escalate on disagreement when the confidence between FinBERT and FinGPT is above a certain level?

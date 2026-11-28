@@ -1,0 +1,11 @@
+FROM hf.co/second-state/FinGPT-MT-Llama-3-8B-LoRA-GGUF:Q4_K_M
+
+TEMPLATE """Instruction: {{ .System }}
+Input: {{ .Prompt }}
+Answer: """
+
+SYSTEM "What is the sentiment of this news? Please choose an answer from {negative/neutral/positive}."
+
+PARAMETER temperature 0
+PARAMETER num_predict 8
+PARAMETER stop "<|end_of_text|>"

@@ -1,0 +1,11 @@
+FROM hf.co/second-state/FinGPT-MT-Llama-3-8B-LoRA-GGUF:Q4_K_M
+
+TEMPLATE """Instruction: {{ .System }}
+Input: {{ .Prompt }}
+Answer: """
+
+SYSTEM """Analyze the news sentiment. Respond with ONLY a JSON object with sentiment (bullish/bearish/neutral), score (-1 to +1), confidence (0-1), entities (array of ticker/name), key_drivers, caveats. No markdown."""
+
+PARAMETER temperature 0
+PARAMETER num_predict 300
+PARAMETER stop "<|end_of_text|>"
